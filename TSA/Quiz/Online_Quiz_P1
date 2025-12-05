@@ -169,7 +169,7 @@ if lb_arma['lb_pvalue'].iloc[0] > 0.05:
 else:
     print("ARMA residuals show significant autocorrelation by Ljung-Box (may be inadequate).")
 
-# Part (e) Rolling one-step-ahead forecasts on test (refit each step) and RMSE
+# Part (e) Rolling one-step-ahead forecasts on test (refit each step)
 def rolling_refit_forecast(order, train_series, test_series):
     history = train_series.copy()
     preds = []
@@ -179,7 +179,7 @@ def rolling_refit_forecast(order, train_series, test_series):
         yhat = float(fc.predicted_mean.iloc[-1])
         preds.append(yhat)
         # update history by appending actual value
-        history = history.append(pd.Series(test_series.iloc[t], index=[test_series.index[t]]))
+        history = pd.concat([history, pd.Series([test_series.iloc[t]], index=[test_series.index[t]])])
     return np.array(preds)
 
 print("Generating rolling one-step-ahead forecasts (refitting at each step)...")
@@ -235,4 +235,3 @@ with open('catfish_outputs/summary.txt', 'w') as f:
     f.write(f"Test RMSE -> ARIMA: {rmse_arima:.6f}, ARMA: {rmse_arma:.6f}\n")
     f.write(f"Winner: {winner}\n")
 print("Saved summary to catfish_outputs/summary.txt")
-
