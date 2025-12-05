@@ -1,0 +1,4 @@
+Best ARIMA order (training by AIC): (4, 1, 4)
+Best ARMA order (training by AIC): (4, 0, 4)
+Test RMSE -> ARIMA: 1683.120950, ARMA: 1909.904659
+Winner: ('ARIMA', (4, 1, 4))

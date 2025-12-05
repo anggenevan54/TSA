@@ -1,0 +1,257 @@
+import warnings
+warnings.filterwarnings("ignore")
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from sklearn.metrics import mean_squared_error
+
+
+# User-adjustable variables
+
+INPUT_CSV = "electricData.csv"
+OUTPUT_CSV = "electric_forecasts_2017_results.csv"
+TRAIN_START = "1986-01-01"
+TRAIN_END   = "2016-12-31"
+TEST_START  = "2017-01-01"
+TEST_END    = "2017-12-31"
+ORDER = (1, 1, 0)
+SEASONAL_ORDER = (1, 1, 0, 12)
+
+
+def safe_read_csv(path):
+    df = pd.read_csv(path)
+    return df
+
+def parse_time_index(df):
+    """
+    Attempt to parse a date/time index for monthly data.
+    Tries common patterns, falls back to generating a monthly index if obvious.
+    """
+    # Look for common date columns
+    date_candidates = [c for c in df.columns if 'date' in c.lower() or 'month' in c.lower() or 'year' in c.lower()]
+    parsed = None
+    if date_candidates:
+        # Try first candidate
+        for c in date_candidates:
+            parsed = pd.to_datetime(df[c], errors='coerce')
+            if parsed.notna().sum() > 0:
+                df['_parsed_date'] = parsed
+                break
+    # If nothing found, try the first column
+    if '_parsed_date' not in df.columns:
+        first = df.columns[0]
+        parsed = pd.to_datetime(df[first], errors='coerce')
+        df['_parsed_date'] = parsed
+
+    # If parsed are mostly NaT, try to construct index assuming the file rows are monthly observations
+    if df['_parsed_date'].isna().mean() > 0.5:
+        # Attempt: if there's a Year and Month columns use them
+        year_col = None
+        month_col = None
+        for c in df.columns:
+            if c.lower().startswith('year'):
+                year_col = c
+            if c.lower().startswith('month'):
+                month_col = c
+        if year_col and month_col:
+            df['_parsed_date'] = pd.to_datetime(df[year_col].astype(int).astype(str) + '-' +
+                                                df[month_col].astype(int).astype(str).str.zfill(2) + '-01')
+        else:
+            # fallback assumption: the series is monthly with first row start 1985-01 (user can change below)
+            # But we will try to detect if a string like "1985-01" appears in any cell
+            possible = None
+            for c in df.columns:
+                if df[c].astype(str).str.contains(r'^\d{4}-\d{2}').any():
+                    possible = c
+                    break
+            if possible is not None:
+                df['_parsed_date'] = pd.to_datetime(df[possible].astype(str).str.extract(r'(^\d{4}-\d{2})')[0] + '-01',
+                                                    errors='coerce')
+            else:
+                # final fallback: create a monthly index starting Jan 1985 and use length of df
+                start = pd.to_datetime("1985-01-01")
+                df['_parsed_date'] = pd.date_range(start=start, periods=len(df), freq='MS')
+
+    # set index and return
+    df = df.set_index('_parsed_date').sort_index()
+    return df
+
+def detect_value_column(df):
+    # pick first numeric column (not the index)
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]) and c != '_parsed_date':
+            return c
+    # else try common names
+    for name in ['Value','value','Electricity','Consumption','consumption']:
+        if name in df.columns:
+            return name
+    # fallback to second column if first is date
+    cols = list(df.columns)
+    if len(cols) >= 1:
+        return cols[0]
+    raise ValueError("Could not detect value column in CSV. Ensure it contains a numeric column with the series.")
+
+def fill_missing(series):
+    # If there are NaNs, use time interpolation to keep monthly continuity
+    n_missing = series.isna().sum()
+    if n_missing > 0:
+        print(f"Found {n_missing} missing values in the series. Applying time-based interpolation.")
+        series = series.interpolate(method='time')
+        remaining = series.isna().sum()
+        if remaining > 0:
+            print(f"After interpolation, {remaining} missing remain. Filling forward then backward.")
+            series = series.fillna(method='ffill').fillna(method='bfill')
+    return series
+
+def fit_sarima(y, order, seasonal_order):
+    model = SARIMAX(y, order=order, seasonal_order=seasonal_order,
+                    enforce_stationarity=False, enforce_invertibility=False)
+    try:
+        res = model.fit(disp=False)
+        return res
+    except Exception as e:
+        # Try alternative optimizers
+        for method in ['powell', 'lbfgs', 'bfgs', 'nm']:
+            try:
+                res = model.fit(method=method, maxiter=200, disp=False)
+                print(f"Fit succeeded using method={method}")
+                return res
+            except Exception:
+                continue
+        # final attempt (let statsmodels decide)
+        res = model.fit(disp=False)
+        return res
+
+def compute_mape(true, pred):
+    true = np.array(true); pred = np.array(pred)
+    mask = true != 0
+    if mask.sum() == 0:
+        return np.nan
+    return np.mean(np.abs((true[mask] - pred[mask]) / true[mask])) * 100.0
+
+
+# Main
+
+if __name__ == "__main__":
+    if not os.path.exists(INPUT_CSV):
+        raise FileNotFoundError(f"{INPUT_CSV} not found. Place the file in the same folder as this script.")
+
+    df_raw = safe_read_csv(INPUT_CSV)
+    print("Columns detected in CSV:", df_raw.columns.tolist())
+
+    df = parse_time_index(df_raw.copy())
+    # detect value column
+    value_col = detect_value_column(df)
+    print("Using value column:", value_col)
+
+    series = df[value_col].astype(float)
+    # force monthly start-of-month frequency for consistency
+    series.index = pd.to_datetime(series.index).to_period('M').to_timestamp('M')  # end-of-month index
+    series = series.asfreq('M')
+
+    print("Series range:", series.index.min().date(), "to", series.index.max().date())
+    print("Total observations:", len(series))
+    print("Missing values before fill:", series.isna().sum())
+
+    series = fill_missing(series)
+    print("Missing after fill:", series.isna().sum())
+
+    # enforce user-specified training/testing periods
+    train = series[TRAIN_START:TRAIN_END]
+    test = series[TEST_START:TEST_END]
+
+    print(f"Training observations: {len(train)} ({train.index.min().date()} to {train.index.max().date()})")
+    print(f"Testing observations: {len(test)} ({test.index.min().date()} to {test.index.max().date()})")
+
+    # check length
+    if len(train) < 24:
+        raise ValueError("Training period too short for SARIMA seasonal modeling - need more observations.")
+
+    # Part (a): Fit on training
+    print("\nFitting SARIMA{} x {} on training data...".format(ORDER, SEASONAL_ORDER))
+    res = fit_sarima(train, ORDER, SEASONAL_ORDER)
+    print("\nModel summary:")
+    print(res.summary())
+
+    # Residual diagnostics
+    resid = res.resid.dropna()
+    print("\nResiduals count:", len(resid))
+    max_lag = min(24, len(resid)-1)
+    if max_lag >= 12:
+        lb = acorr_ljungbox(resid, lags=[12, max_lag], return_df=True)
+        print("\nLjung-Box test (lags 12 and {0}):".format(max_lag))
+        print(lb)
+    else:
+        print("Not enough residuals to run Ljung-Box with lag 12/24; skipping.")
+
+    # Quick residual plots
+    plt.figure(figsize=(10,3))
+    plt.plot(resid)
+    plt.title("Residuals from fitted SARIMA model (training)")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8,3))
+    plt.hist(resid, bins=20)
+    plt.title("Histogram of residuals")
+    plt.tight_layout()
+    plt.show()
+
+    # Part (b): Rolling one-step-ahead forecasts for each month in 2017
+    history = train.copy()
+    predictions = []
+    pred_index = []
+
+    print("\nPerforming rolling one-step-ahead forecasts for each month of 2017 (re-fitting each time)...")
+    for idx in test.index:
+        # fit on available history
+        r = fit_sarima(history, ORDER, SEASONAL_ORDER)
+        fc = r.get_forecast(steps=1)
+        pred = float(fc.predicted_mean.iloc[0])
+        predictions.append(pred)
+        pred_index.append(idx)
+        # append actual observed value from test to history (recursive update)
+        history = pd.concat([history, pd.Series({idx: float(test.loc[idx])})])
+
+    preds = pd.Series(predictions, index=pred_index, name='forecast_2017')
+
+    # Part (c): Forecast accuracy
+    test_aligned = test.reindex(preds.index)
+    mape_val = compute_mape(test_aligned.values, preds.values)
+    rmse_val = np.sqrt(mean_squared_error(test_aligned.values, preds.values))
+
+    print("\nForecast accuracy for 2017:")
+    print(f"  MAPE = {mape_val:.4f}%")
+    print(f"  RMSE = {rmse_val:.4f} (same units as series)")
+
+    # Save results
+    results = pd.DataFrame({
+        'actual_2017': test_aligned,
+        'forecast_2017': preds,
+        'error': test_aligned - preds
+    })
+    results.to_csv(OUTPUT_CSV)
+    print("\nSaved forecast results to:", OUTPUT_CSV)
+
+    # Plot observed vs forecasts
+    plt.figure(figsize=(12,4))
+    plt.plot(series.index, series.values, label='Observed (all)')
+    plt.plot(preds.index, preds.values, linestyle='--', marker='o', label='Rolling 1-step Forecast (2017)')
+    plt.plot(test.index, test.values, linestyle='-', marker='x', label='Actual 2017')
+    plt.legend()
+    plt.title('Monthly Electric Consumption: Observed vs Rolling 1-step Forecasts (2017)')
+    plt.xlabel('Date')
+    plt.ylabel(value_col)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot forecast errors
+    plt.figure(figsize=(10,3))
+    plt.plot(results.index, results['error'].values, marker='o')
+    plt.axhline(0, linestyle='--')
+    plt.title('Forecast Errors (Actual - Forecast) for 2017')
+    plt.tight_layout()
+    plt.show()

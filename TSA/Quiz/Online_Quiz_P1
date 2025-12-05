@@ -1,0 +1,238 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.seasonal import seasonal_decompose
+from sklearn.metrics import mean_squared_error
+import math
+
+# User-adjustable filename
+FNAME = "catfish.csv"
+
+
+if not os.path.exists(FNAME):
+    raise FileNotFoundError(f"File '{FNAME}' not found in working directory: {os.listdir('.')}")
+
+# 1) Read file and identify columns
+df = pd.read_csv(FNAME)
+
+# Try to find a date column
+date_col = None
+for c in df.columns:
+    if 'date' in c.lower() or 'year' in c.lower() or 'month' in c.lower():
+        date_col = c
+        break
+if date_col is None:
+    date_col = df.columns[0]  # fallback to first column
+
+# Handle case where there are separate year and month columns
+cols_lower = [c.lower() for c in df.columns]
+if 'year' in cols_lower and 'month' in cols_lower:
+    yc = df.columns[cols_lower.index('year')]
+    mc = df.columns[cols_lower.index('month')]
+    df['date'] = pd.to_datetime(df[yc].astype(int).astype(str) + '-' + df[mc].astype(int).astype(str) + '-01')
+    date_col = 'date'
+else:
+    # try parsing existing date column
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+    except Exception:
+        # if it's numeric year only
+        if pd.api.types.is_numeric_dtype(df[date_col]):
+            df['date'] = pd.to_datetime(df[date_col].astype(int).astype(str) + '-01-01')
+            date_col = 'date'
+        else:
+            raise ValueError("Could not parse the date column. Please ensure file has a parseable date column.")
+
+# Choose sales column: prefer names with sale/sales/catfish
+value_col = None
+for c in df.columns:
+    if c == date_col:
+        continue
+    if any(k in c.lower() for k in ['sale','sales','catfish','value','quantity']):
+        value_col = c
+        break
+if value_col is None:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if len(numeric_cols) == 0:
+        raise ValueError("No numeric column found for sales. Please provide a numeric sales column.")
+    value_col = numeric_cols[0]
+
+# Prepare time series (monthly)
+df = df[[date_col, value_col]].dropna().copy()
+df.columns = ['date', 'sales']
+df = df.sort_values('date').reset_index(drop=True)
+df['date'] = pd.to_datetime(df['date'])
+df = df.set_index('date').asfreq('MS')  # monthly start frequency
+
+# Subset to 2000-01 - 2010-12 as requested (if data available)
+start_req = pd.to_datetime('2000-01-01')
+end_req = pd.to_datetime('2010-12-01')
+if (df.index.min() <= start_req) and (df.index.max() >= end_req):
+    ts = df.loc[start_req:end_req, 'sales'].copy()
+else:
+    # if range not fully available, try to subset overlapping portion
+    ts = df['sales'].copy()
+    ts = ts[(ts.index >= start_req) & (ts.index <= end_req)]
+    if len(ts) == 0:
+        raise ValueError("No data available in the 2000-01 to 2010-12 window. Please check your CSV.")
+
+print("Time series period:", ts.index.min().date(), "to", ts.index.max().date(), " (n=", len(ts), ")")
+
+
+# Part (a) ACF/PACF up to lag 20
+plt.figure(figsize=(10,3))
+plt.plot(ts); plt.title('Monthly Catfish Sales'); plt.ylabel('Sales'); plt.xlabel('Date')
+plt.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(2,1, figsize=(10,6))
+plot_acf(ts.dropna(), lags=20, ax=axes[0]); axes[0].set_title('ACF (lags up to 20)')
+plot_pacf(ts.dropna(), lags=20, ax=axes[1], method='ywm'); axes[1].set_title('PACF (lags up to 20)')
+plt.tight_layout(); plt.show()
+
+print("Note: Look for slow decay in ACF (nonstationarity) and spikes in PACF suggesting AR order; check seasonal lag 12 for monthly data.")
+
+# Seasonality check
+decomp = seasonal_decompose(ts.dropna(), model='additive', period=12, extrapolate_trend='freq')
+fig = decomp.plot()
+fig.set_size_inches(10,8)
+plt.suptitle('Seasonal Decomposition (period=12)'); plt.show()
+
+# ADF test to assess d
+adf_stat, adf_p, *_ = adfuller(ts.dropna())
+print(f"ADF statistic = {adf_stat:.4f}, p-value = {adf_p:.4f}")
+d = 0 if adf_p < 0.05 else 1
+print("Choosing d =", d)
+
+# Part (b) Split: train 2000-01 to 2009-12, test 2010-01 to 2010-12
+train = ts['2000-01-01':'2009-12-01'].copy()
+test = ts['2010-01-01':'2010-12-01'].copy()
+if len(train)==0 or len(test)==0:
+    raise ValueError("Train or test segment empty. Ensure data covers 2000-2010.")
+print("Training:", train.index.min().date(), "to", train.index.max().date(), " (n=",len(train),")")
+print("Testing:", test.index.min().date(), "to", test.index.max().date(), " (n=",len(test),")")
+
+# Utility: grid-search for best (p,d,q) by AIC (p,q up to 4)
+def select_order_by_aic(series, p_max=4, q_max=4, d=0):
+    best_aic = np.inf
+    best_order = None
+    best_model = None
+    for p in range(p_max+1):
+        for q in range(q_max+1):
+            try:
+                m = ARIMA(series, order=(p,d,q))
+                res = m.fit()
+                if res.aic < best_aic:
+                    best_aic = res.aic
+                    best_order = (p,d,q)
+                    best_model = res
+            except Exception:
+                continue
+    return best_order, best_model
+
+print("Selecting ARIMA(p,d,q) on training by AIC (p,q <= 4)...")
+best_order_arima, best_model_arima = select_order_by_aic(train, p_max=4, q_max=4, d=d)
+print("Best ARIMA order:", best_order_arima)
+
+# Residual diagnostics for ARIMA
+resid = best_model_arima.resid
+plt.figure(figsize=(10,3)); plt.plot(resid); plt.title(f'ARIMA{best_order_arima} Residuals'); plt.show()
+plt.figure(figsize=(10,3)); plot_acf(resid.dropna(), lags=20); plt.title('ACF of ARIMA residuals'); plt.show()
+lb = acorr_ljungbox(resid.dropna(), lags=[10], return_df=True)
+print("Ljung-Box (lag=10):\n", lb)
+
+# Conclusion on adequacy
+if lb['lb_pvalue'].iloc[0] > 0.05:
+    print("ARIMA residuals appear uncorrelated by Ljung-Box (good).")
+else:
+    print("ARIMA residuals show significant autocorrelation by Ljung-Box (may be inadequate).")
+
+
+# Part (d) Fit ARMA (force d=0)
+print("Selecting ARMA(p,q) on training by AIC (forcing d=0)...")
+best_order_arma, best_model_arma = select_order_by_aic(train, p_max=4, q_max=4, d=0)
+print("Best ARMA order (ARIMA(p,0,q)):", best_order_arma)
+
+resid_arma = best_model_arma.resid
+plt.figure(figsize=(10,3)); plt.plot(resid_arma); plt.title(f'ARMA{best_order_arma} Residuals'); plt.show()
+plt.figure(figsize=(10,3)); plot_acf(resid_arma.dropna(), lags=20); plt.title('ACF of ARMA residuals'); plt.show()
+lb_arma = acorr_ljungbox(resid_arma.dropna(), lags=[10], return_df=True)
+print("Ljung-Box (lag=10) for ARMA:\n", lb_arma)
+if lb_arma['lb_pvalue'].iloc[0] > 0.05:
+    print("ARMA residuals appear uncorrelated by Ljung-Box (good).")
+else:
+    print("ARMA residuals show significant autocorrelation by Ljung-Box (may be inadequate).")
+
+# Part (e) Rolling one-step-ahead forecasts on test (refit each step) and RMSE
+def rolling_refit_forecast(order, train_series, test_series):
+    history = train_series.copy()
+    preds = []
+    for t in range(len(test_series)):
+        model = ARIMA(history, order=order).fit()
+        fc = model.get_forecast(steps=1)
+        yhat = float(fc.predicted_mean.iloc[-1])
+        preds.append(yhat)
+        # update history by appending actual value
+        history = history.append(pd.Series(test_series.iloc[t], index=[test_series.index[t]]))
+    return np.array(preds)
+
+print("Generating rolling one-step-ahead forecasts (refitting at each step)...")
+preds_arima = rolling_refit_forecast(best_order_arima, train, test)
+preds_arma  = rolling_refit_forecast(best_order_arma,  train, test)
+
+rmse_arima = math.sqrt(mean_squared_error(test.values, preds_arima))
+rmse_arma  = math.sqrt(mean_squared_error(test.values, preds_arma))
+print(f"Test RMSE -> ARIMA{best_order_arima}: {rmse_arima:.4f}; ARMA{best_order_arma}: {rmse_arma:.4f}")
+
+if rmse_arima < rmse_arma:
+    winner = ('ARIMA', best_order_arima)
+else:
+    winner = ('ARMA', best_order_arma)
+print("Better model on test set:", winner)
+
+print("Reminder: Use testing set only for evaluating forecast accuracy to avoid optimistic (overfit) estimates from training data.")
+
+# Plot actual vs forecasts
+plt.figure(figsize=(10,4))
+plt.plot(train.index, train.values, label='Train')
+plt.plot(test.index, test.values, label='Test (actual)')
+plt.plot(test.index, preds_arima, label=f'ARIMA{best_order_arima} preds', marker='o')
+plt.plot(test.index, preds_arma, label=f'ARMA{best_order_arma} preds', marker='x')
+plt.legend(); plt.title('One-step-ahead rolling forecasts on test period'); plt.show()
+
+
+# Part (f) Refit winner to full 2000-01..2010-12 and forecast Jan 2011-Dec 2011
+full = ts.copy()
+best_model_name = winner[0]
+best_model_order = winner[1]
+print("Refitting best model to full data:", best_model_name, best_model_order)
+best_full = ARIMA(full, order=best_model_order).fit()
+fc = best_full.get_forecast(steps=12, alpha=0.05)
+fc_mean = fc.predicted_mean
+fc_ci = fc.conf_int(alpha=0.05)
+fc_index = pd.date_range(start=full.index[-1] + pd.DateOffset(months=1), periods=12, freq='MS')
+
+fc_mean.index = fc_index
+fc_ci.index = fc_index
+
+plt.figure(figsize=(10,4))
+plt.plot(full, label='Observed')
+plt.plot(fc_mean, label='Forecast (2011)')
+plt.fill_between(fc_index, fc_ci.iloc[:,0], fc_ci.iloc[:,1], alpha=0.25, label='95% PI')
+plt.legend(); plt.title(f'Forecasts Jan 2011 - Dec 2011 using {best_model_name}{best_model_order}'); plt.show()
+
+# Save outputs
+os.makedirs('catfish_outputs', exist_ok=True)
+with open('catfish_outputs/summary.txt', 'w') as f:
+    f.write(f"Best ARIMA order (training by AIC): {best_order_arima}\n")
+    f.write(f"Best ARMA order (training by AIC): {best_order_arma}\n")
+    f.write(f"Test RMSE -> ARIMA: {rmse_arima:.6f}, ARMA: {rmse_arma:.6f}\n")
+    f.write(f"Winner: {winner}\n")
+print("Saved summary to catfish_outputs/summary.txt")
+
